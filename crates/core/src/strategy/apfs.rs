@@ -110,10 +110,19 @@ fn copy_metadata_apfs(from: &Path, to: &Path, target: MetadataTarget) -> Result<
     if unsafe { libc::lchown(destination.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    // Copy extended attributes *before* applying the final mode. `clonefile`
+    // already reproduces the source mode on the destination, so read-only
+    // source files (e.g. git objects are 0o444) leave the destination
+    // unwritable — and `setxattr` requires write access, so copying xattrs
+    // first would fail with EACCES. Temporarily ensure the owner-write bit is
+    // set during the xattr copy, then apply the exact source mode last.
+    if matches!(target, MetadataTarget::FileOrDirectory) {
+        fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode() | 0o200))?;
+    }
+    copy_xattrs_apfs(from, to)?;
     if matches!(target, MetadataTarget::FileOrDirectory) {
         fs::set_permissions(to, fs::Permissions::from_mode(metadata.mode()))?;
     }
-    copy_xattrs_apfs(from, to)?;
     let times = [
         libc::timespec {
             tv_sec: metadata.atime(),
@@ -330,5 +339,83 @@ mod tests {
             fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn filtered_strategy_copies_xattrs_onto_read_only_files() {
+        // Regression: `clonefile` reproduces the source mode on the destination,
+        // so a read-only source file (e.g. git objects are 0o444) yields a
+        // read-only clone. `setxattr` requires write access, so copying xattrs
+        // after applying the mode failed with EACCES. The metadata copy must set
+        // xattrs while the file is still writable, then apply the final mode.
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        let file = source.join("object");
+        fs::write(&file, "payload").unwrap();
+        set_xattr(&file, "user.rift_test", b"value");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+
+        ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::Filtered)
+            .unwrap();
+
+        let cloned = destination.join("object");
+        assert_eq!(
+            fs::metadata(&cloned).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(get_xattr(&cloned, "user.rift_test"), b"value");
+    }
+
+    fn set_xattr(path: &Path, name: &str, value: &[u8]) {
+        let path = c_path(path).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: `path` and `name` are valid C strings, and `value` is valid
+        // for reads of its length.
+        let result = unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    fn get_xattr(path: &Path, name: &str) -> Vec<u8> {
+        let path = c_path(path).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: `path` and `name` are valid C strings; a null buffer asks the
+        // kernel for the value length.
+        let size = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        assert!(size >= 0, "{}", std::io::Error::last_os_error());
+        let mut value = vec![0_u8; size as usize];
+        // SAFETY: `value` is sized to the length reported above.
+        let read = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        assert_eq!(read, size, "{}", std::io::Error::last_os_error());
+        value
     }
 }
