@@ -33,6 +33,7 @@ export function rpc(executable: string, request: object, signal: AbortSignal): P
       stdio: ["pipe", "pipe", "pipe"],
     })
     const chunks: Buffer[] = []
+    let tail = Buffer.alloc(0)
     let size = 0
     let settled = false
     const finish = (result: () => void) => {
@@ -62,24 +63,36 @@ export function rpc(executable: string, request: object, signal: AbortSignal): P
       }
       chunks.push(chunk)
     })
-    child.stderr.pipe(process.stderr, { end: false })
+    // The background host's stderr may have no reader. Forwarding to it can
+    // pause this stream forever, preventing the child's close event.
+    child.stderr.on("data", (chunk: Buffer) => {
+      tail = Buffer.concat([tail, chunk]).subarray(-8 * 1024)
+    })
+    // Hook output only reaches the host through these messages, and hook
+    // failures arrive as structured errors from a zero exit.
+    const describe = (message: string) => {
+      const detail = tail.toString().trim()
+      return detail ? `${message}: ${detail}` : message
+    }
     child.on("error", (error) => finish(() => reject(error)))
     child.stdin.on("error", (error) => finish(() => reject(error)))
     child.on("close", (code) => {
       if (settled) return
-      if (code !== 0) return finish(() => reject(new Error(`Rift exited with status ${code}`)))
+      if (code !== 0) return finish(() => reject(new Error(describe(`Rift exited with status ${code}`))))
+      const invalid = () => finish(() => reject(new Error(describe("Rift returned an invalid RPC response"))))
       let response: unknown
       try {
         response = JSON.parse(Buffer.concat(chunks).toString())
       } catch {
-        return finish(() => reject(new Error("Rift returned an invalid RPC response")))
+        return invalid()
       }
-      if (!response || typeof response !== "object" || !("status" in response))
-        return finish(() => reject(new Error("Rift returned an invalid RPC response")))
+      if (!response || typeof response !== "object" || !("status" in response)) return invalid()
       if (response.status === "ok" && "value" in response) return finish(() => resolve(response.value))
-      if (response.status === "error" && "error" in response && response.error && typeof response.error === "object")
-        return finish(() => reject(new RpcError(response.error as Failure)))
-      finish(() => reject(new Error("Rift returned an invalid RPC response")))
+      if (response.status === "error" && "error" in response && response.error && typeof response.error === "object") {
+        const failure = response.error as Failure
+        return finish(() => reject(new RpcError({ ...failure, message: describe(failure.message) })))
+      }
+      invalid()
     })
     child.stdin.end(JSON.stringify(request))
   })
