@@ -51,6 +51,19 @@ pub enum Error {
     MissingMarker(PathBuf),
     #[error("unsupported filesystem entry: {0}")]
     UnsupportedEntry(PathBuf),
+    #[error(
+        "clone failed for {root}: {source}. Found {path}, {problem}, which blocks whole-tree \
+         cloning. Run `chmod {permission} {}`, or remove it if it is empty and untracked",
+        shell_quote(.path)
+    )]
+    BlockedEntry {
+        root: PathBuf,
+        path: PathBuf,
+        problem: &'static str,
+        permission: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("unsafe Git source: {0}")]
     UnsafeGit(String),
     #[error("directory is not managed by rift: {0}")]
@@ -76,6 +89,19 @@ pub enum Error {
         command: String,
         message: String,
     },
+}
+
+/// Quotes `path` for a POSIX shell, leaving plain paths unquoted.
+fn shell_quote(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if !path.is_empty()
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        return path.into_owned();
+    }
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 pub struct Create {

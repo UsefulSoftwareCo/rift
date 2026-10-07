@@ -33,6 +33,7 @@ export type RiftErrorCode =
   | "workspace_not_initialized"
   | "missing_marker"
   | "unsupported_entry"
+  | "blocked_entry"
   | "unsafe_git"
   | "not_managed"
   | "marker_mismatch"
