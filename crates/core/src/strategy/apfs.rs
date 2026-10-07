@@ -108,7 +108,8 @@ fn refused_clone_error(from: &Path, to: &Path, error: std::io::Error) -> Error {
 }
 
 /// The kernel also refuses a clone with `EACCES` or `EPERM` when the
-/// destination parent is not writable or is immutable or append-only.
+/// destination parent is not writable or is immutable. An append-only parent
+/// still accepts a new entry, so it does not refuse the clone.
 fn destination_refuses(to: &Path) -> bool {
     use std::os::macos::fs::MetadataExt;
 
@@ -119,7 +120,7 @@ fn destination_refuses(to: &Path) -> bool {
     if !matches!(accessible(parent, libc::W_OK | libc::X_OK), Ok(true)) {
         return true;
     }
-    let flags = libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+    let flags = libc::UF_IMMUTABLE | libc::SF_IMMUTABLE;
     fs::metadata(parent).map_or(true, |metadata| metadata.st_flags() & flags != 0)
 }
 
