@@ -9,7 +9,7 @@ pub(super) struct ApfsStrategy;
 impl Strategy for ApfsStrategy {
     fn copy_directory(&self, from: &Path, to: &Path, mode: CopyMode) -> Result<()> {
         match mode {
-            CopyMode::All => clone_path_apfs(from, to),
+            CopyMode::All => clone_tree_apfs(from, to),
             CopyMode::Filtered => clone_filtered_directory_apfs(from, to),
         }
     }
@@ -78,29 +78,135 @@ fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-fn clone_path_apfs(from: &Path, to: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+/// Clones a directory tree in one `clonefile` call. The kernel refuses the
+/// whole call with `EACCES` when any file inside is unreadable or any directory
+/// inside is unreadable or unsearchable, even one the caller owns, and the
+/// error names only the root. A refused call leaves nothing behind, so the
+/// source is scanned for the entry to name instead. The source is not changed.
+fn clone_tree_apfs(from: &Path, to: &Path) -> Result<()> {
+    clonefile(&c_path(from)?, &c_path(to)?).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+            && let Some(blocked) = find_blocked_entry(from)
+        {
+            return blocked;
+        }
+        clone_error(from, to, error)
+    })
+}
 
-    let source = CString::new(from.as_os_str().as_bytes())
-        .map_err(|_| Error::Path(format!("path contains a null byte: {}", from.display())))?;
-    let destination = CString::new(to.as_os_str().as_bytes())
-        .map_err(|_| Error::Path(format!("path contains a null byte: {}", to.display())))?;
-    // SAFETY: `source` and `destination` are null-terminated C strings
-    // built above, and both live for the duration of the call.
-    let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) };
-    if result == 0 {
+/// Finds the first entry that makes a whole-tree clone of `root` fail.
+/// `node_modules` directories are large and rarely the cause, so they are
+/// searched only after the rest of the tree comes up clean.
+fn find_blocked_entry(root: &Path) -> Option<Error> {
+    let mut deferred = Vec::new();
+    scan_for_blocked_entry(root, root, Some(&mut deferred)).or_else(|| {
+        deferred
+            .iter()
+            .find_map(|path| scan_for_blocked_entry(root, path, None))
+    })
+}
+
+fn scan_for_blocked_entry(
+    root: &Path,
+    from: &Path,
+    mut deferred: Option<&mut Vec<std::path::PathBuf>>,
+) -> Option<Error> {
+    let mut entries = WalkDir::new(from).follow_links(false).into_iter();
+    while let Some(entry) = entries.next() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => match error.path() {
+                Some(path) => return Some(blocked_entry(root, path, "an unreadable entry", "u+r")),
+                None => continue,
+            },
+        };
+        let path = entry.path();
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            match (accessible(path, libc::R_OK), accessible(path, libc::X_OK)) {
+                (true, true) => {}
+                (true, false) => {
+                    return Some(blocked_entry(
+                        root,
+                        path,
+                        "a directory without search permission",
+                        "u+x",
+                    ));
+                }
+                (false, true) => {
+                    return Some(blocked_entry(root, path, "an unreadable directory", "u+r"));
+                }
+                (false, false) => {
+                    return Some(blocked_entry(
+                        root,
+                        path,
+                        "an unreadable directory without search permission",
+                        "u+rx",
+                    ));
+                }
+            }
+            if entry.depth() > 0
+                && entry.file_name() == "node_modules"
+                && let Some(deferred) = deferred.as_deref_mut()
+            {
+                deferred.push(path.to_path_buf());
+                entries.skip_current_dir();
+            }
+        } else if file_type.is_file() && !accessible(path, libc::R_OK) {
+            return Some(blocked_entry(root, path, "an unreadable file", "u+r"));
+        }
+    }
+    None
+}
+
+fn accessible(path: &Path, mode: libc::c_int) -> bool {
+    let Ok(path) = c_path(path) else {
+        return true;
+    };
+    // SAFETY: `path` is a null-terminated C string that lives for the call.
+    unsafe { libc::access(path.as_ptr(), mode) == 0 }
+}
+
+fn blocked_entry(
+    root: &Path,
+    path: &Path,
+    problem: &'static str,
+    permission: &'static str,
+) -> Error {
+    Error::BlockedEntry {
+        root: root.to_path_buf(),
+        path: path.to_path_buf(),
+        problem,
+        permission,
+    }
+}
+
+fn clone_path_apfs(from: &Path, to: &Path) -> Result<()> {
+    clonefile(&c_path(from)?, &c_path(to)?).map_err(|error| clone_error(from, to, error))
+}
+
+fn clonefile(source: &std::ffi::CStr, destination: &std::ffi::CStr) -> std::io::Result<()> {
+    // SAFETY: `source` and `destination` are null-terminated C strings that
+    // live for the duration of the call.
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
+    Err(std::io::Error::last_os_error())
+}
+
+/// Only a filesystem or volume that cannot clone means copy-on-write is
+/// unavailable. Other errors, such as permissions, `ENOSPC` or `EIO`, are
+/// reported as a failed clone of `from`.
+fn clone_error(from: &Path, to: &Path, error: std::io::Error) -> Error {
     if error.kind() == std::io::ErrorKind::AlreadyExists {
-        return Err(Error::AlreadyExists(to.to_path_buf()));
+        return Error::AlreadyExists(to.to_path_buf());
     }
-    Err(Error::CowUnavailable(format!(
-        "failed to clone {}: {}",
-        from.display(),
-        error
-    )))
+    match error.raw_os_error() {
+        Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EXDEV) => {
+            Error::CowUnavailable(format!("failed to clone {}: {}", from.display(), error))
+        }
+        _ => io_at("clone", from, error),
+    }
 }
 
 /// Replays metadata onto a directory or symlink created fresh at `to`. Cloned

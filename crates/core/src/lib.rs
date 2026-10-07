@@ -51,6 +51,16 @@ pub enum Error {
     MissingMarker(PathBuf),
     #[error("unsupported filesystem entry: {0}")]
     UnsupportedEntry(PathBuf),
+    #[error(
+        "cannot clone {root}: {path} is {problem}, so the whole-tree clone is refused. \
+         Run `chmod {permission} {path}`, or remove it if it is empty and untracked"
+    )]
+    BlockedEntry {
+        root: PathBuf,
+        path: PathBuf,
+        problem: &'static str,
+        permission: &'static str,
+    },
     #[error("unsafe Git source: {0}")]
     UnsafeGit(String),
     #[error("directory is not managed by rift: {0}")]

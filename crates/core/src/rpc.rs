@@ -94,6 +94,7 @@ impl From<Error> for Failure {
             }
             Error::MissingMarker(path) => ("missing_marker", Some(path.clone())),
             Error::UnsupportedEntry(path) => ("unsupported_entry", Some(path.clone())),
+            Error::BlockedEntry { path, .. } => ("blocked_entry", Some(path.clone())),
             Error::UnsafeGit(_) => ("unsafe_git", None),
             Error::NotManaged(path) => ("not_managed", Some(path.clone())),
             Error::MarkerMismatch(path) => ("marker_mismatch", Some(path.clone())),
