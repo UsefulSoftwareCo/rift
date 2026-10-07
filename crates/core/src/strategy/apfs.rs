@@ -457,6 +457,99 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    /// Regression: the kernel refuses a whole-tree `clonefile` with `EACCES`
+    /// when any directory inside lacks the search bit, even one the caller
+    /// owns. Two empty `0644` directories in a checkout made every
+    /// `rift create --copy-all` from it fail with an error that named only the
+    /// root and blamed copy-on-write support.
+    #[test]
+    fn full_copy_names_a_directory_without_search_permission() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let unsearchable = source.join("lib");
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "module").unwrap();
+        fs::create_dir(&unsearchable).unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::All)
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::BlockedEntry { path, permission: "u+x", .. } if path == &unsearchable),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("chmod u+x {}", unsearchable.display())),
+            "{message}"
+        );
+        assert!(!message.contains("copy-on-write"), "{message}");
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::metadata(&unsearchable).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("node_modules/pkg/index.js")).unwrap(),
+            "module"
+        );
+    }
+
+    /// `node_modules` is searched last, but a blocked entry inside it is still
+    /// named.
+    #[test]
+    fn full_copy_names_a_blocked_entry_inside_node_modules() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let unreadable = source.join("node_modules/pkg/index.js");
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(&unreadable, "module").unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o200)).unwrap();
+
+        let result = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, Error::BlockedEntry { path, permission: "u+r", .. } if path == &unreadable),
+            "{error:?}"
+        );
+        assert!(!destination.exists());
+    }
+
+    /// Only a filesystem that cannot clone means copy-on-write is unavailable.
+    #[test]
+    fn clone_errors_name_copy_on_write_only_when_it_is_unavailable() {
+        let from = Path::new("/source");
+        let to = Path::new("/destination");
+        for errno in [libc::ENOSPC, libc::EIO, libc::EACCES] {
+            let message =
+                clone_error(from, to, std::io::Error::from_raw_os_error(errno)).to_string();
+            assert!(
+                message.starts_with("clone failed for /source: "),
+                "{message}"
+            );
+        }
+        for errno in [libc::EXDEV, libc::ENOTSUP] {
+            assert!(matches!(
+                clone_error(from, to, std::io::Error::from_raw_os_error(errno)),
+                Error::CowUnavailable(_)
+            ));
+        }
+    }
+
     #[test]
     fn integration_environment_is_required_by_ci() {
         if std::env::var_os("RIFT_REQUIRE_APFS_TESTS").is_some() {
