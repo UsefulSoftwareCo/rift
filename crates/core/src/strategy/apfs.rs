@@ -82,67 +82,109 @@ fn clone_filtered_directory_apfs(from: &Path, to: &Path) -> Result<()> {
 /// whole call with `EACCES` when any file inside is unreadable or any directory
 /// inside is unreadable or unsearchable, even one the caller owns, and the
 /// error names only the root. A refused call leaves nothing behind, so the
-/// source is scanned for the entry to name instead. The source is not changed.
+/// source is scanned for a likely culprit. The source is not changed.
 fn clone_tree_apfs(from: &Path, to: &Path) -> Result<()> {
-    clonefile(&c_path(from)?, &c_path(to)?).map_err(|error| {
-        if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
-            && let Some(blocked) = find_blocked_entry(from)
-        {
-            return blocked;
-        }
-        clone_error(from, to, error)
-    })
+    clonefile(&c_path(from)?, &c_path(to)?).map_err(|error| refused_clone_error(from, to, error))
 }
 
-/// Finds the first entry that makes a whole-tree clone of `root` fail.
-/// `node_modules` directories are large and rarely the cause, so they are
-/// searched only after the rest of the tree comes up clean.
-fn find_blocked_entry(root: &Path) -> Option<Error> {
+/// Keeps the kernel's error and adds an entry that blocks whole-tree cloning
+/// when one is found. The source is blamed only when the destination parent
+/// looks writable and the scan finds an entry the caller is denied. Any other
+/// scan failure is inconclusive.
+fn refused_clone_error(from: &Path, to: &Path, error: std::io::Error) -> Error {
+    if !is_denied(&error) || destination_refuses(to) {
+        return clone_error(from, to, error);
+    }
+    match find_blocked_entry(from) {
+        Ok(Some(blocked)) => Error::BlockedEntry {
+            root: from.to_path_buf(),
+            path: blocked.path,
+            problem: blocked.problem,
+            permission: blocked.permission,
+            source: error,
+        },
+        Ok(None) | Err(_) => clone_error(from, to, error),
+    }
+}
+
+/// The kernel also refuses a clone with `EACCES` or `EPERM` when the
+/// destination parent is not writable or is immutable or append-only.
+fn destination_refuses(to: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+
+    let parent = match to.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !matches!(accessible(parent, libc::W_OK | libc::X_OK), Ok(true)) {
+        return true;
+    }
+    let flags = libc::UF_IMMUTABLE | libc::UF_APPEND | libc::SF_IMMUTABLE | libc::SF_APPEND;
+    fs::metadata(parent).map_or(true, |metadata| metadata.st_flags() & flags != 0)
+}
+
+struct Blocked {
+    path: std::path::PathBuf,
+    problem: &'static str,
+    permission: &'static str,
+}
+
+/// Finds the first entry the caller is denied, which makes a whole-tree clone
+/// of `root` fail. `node_modules` directories are large and rarely the cause,
+/// so they are searched only after the rest of the tree comes up clean. An
+/// `Err` means the scan could not finish, so nothing can be blamed.
+fn find_blocked_entry(root: &Path) -> std::io::Result<Option<Blocked>> {
     let mut deferred = Vec::new();
-    scan_for_blocked_entry(root, root, Some(&mut deferred)).or_else(|| {
-        deferred
-            .iter()
-            .find_map(|path| scan_for_blocked_entry(root, path, None))
-    })
+    if let Some(blocked) = scan_for_blocked_entry(root, Some(&mut deferred))? {
+        return Ok(Some(blocked));
+    }
+    for path in &deferred {
+        if let Some(blocked) = scan_for_blocked_entry(path, None)? {
+            return Ok(Some(blocked));
+        }
+    }
+    Ok(None)
 }
 
 fn scan_for_blocked_entry(
-    root: &Path,
     from: &Path,
     mut deferred: Option<&mut Vec<std::path::PathBuf>>,
-) -> Option<Error> {
+) -> std::io::Result<Option<Blocked>> {
     let mut entries = WalkDir::new(from).follow_links(false).into_iter();
     while let Some(entry) = entries.next() {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) => match error.path() {
-                Some(path) => return Some(blocked_entry(root, path, "an unreadable entry", "u+r")),
-                None => continue,
-            },
+            Err(error) => {
+                let denied = error.io_error().is_some_and(is_denied);
+                return match error.path() {
+                    Some(path) if denied => Ok(Some(blocked(path, "an unreadable entry", "u+r"))),
+                    _ => Err(error
+                        .into_io_error()
+                        .unwrap_or_else(|| std::io::Error::other("filesystem loop"))),
+                };
+            }
         };
         let path = entry.path();
         let file_type = entry.file_type();
         if file_type.is_dir() {
-            match (accessible(path, libc::R_OK), accessible(path, libc::X_OK)) {
+            match (accessible(path, libc::R_OK)?, accessible(path, libc::X_OK)?) {
                 (true, true) => {}
                 (true, false) => {
-                    return Some(blocked_entry(
-                        root,
+                    return Ok(Some(blocked(
                         path,
                         "a directory without search permission",
                         "u+x",
-                    ));
+                    )));
                 }
                 (false, true) => {
-                    return Some(blocked_entry(root, path, "an unreadable directory", "u+r"));
+                    return Ok(Some(blocked(path, "an unreadable directory", "u+r")));
                 }
                 (false, false) => {
-                    return Some(blocked_entry(
-                        root,
+                    return Ok(Some(blocked(
                         path,
                         "an unreadable directory without search permission",
                         "u+rx",
-                    ));
+                    )));
                 }
             }
             if entry.depth() > 0
@@ -152,29 +194,36 @@ fn scan_for_blocked_entry(
                 deferred.push(path.to_path_buf());
                 entries.skip_current_dir();
             }
-        } else if file_type.is_file() && !accessible(path, libc::R_OK) {
-            return Some(blocked_entry(root, path, "an unreadable file", "u+r"));
+        } else if file_type.is_file() && !accessible(path, libc::R_OK)? {
+            return Ok(Some(blocked(path, "an unreadable file", "u+r")));
         }
     }
-    None
+    Ok(None)
 }
 
-fn accessible(path: &Path, mode: libc::c_int) -> bool {
-    let Ok(path) = c_path(path) else {
-        return true;
-    };
+fn is_denied(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+/// Returns whether the caller has `mode` access to `path`. Only `EACCES` and
+/// `EPERM` mean access is denied; any other failure is returned as an error.
+fn accessible(path: &Path, mode: libc::c_int) -> std::io::Result<bool> {
+    let path = c_path(path).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
     // SAFETY: `path` is a null-terminated C string that lives for the call.
-    unsafe { libc::access(path.as_ptr(), mode) == 0 }
+    if unsafe { libc::access(path.as_ptr(), mode) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if is_denied(&error) {
+        return Ok(false);
+    }
+    Err(error)
 }
 
-fn blocked_entry(
-    root: &Path,
-    path: &Path,
-    problem: &'static str,
-    permission: &'static str,
-) -> Error {
-    Error::BlockedEntry {
-        root: root.to_path_buf(),
+fn blocked(path: &Path, problem: &'static str, permission: &'static str) -> Blocked {
+    Blocked {
         path: path.to_path_buf(),
         problem,
         permission,
