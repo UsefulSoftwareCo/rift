@@ -433,6 +433,7 @@ fn c_path(path: &Path) -> Result<std::ffi::CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::TempDir;
 
@@ -455,6 +456,296 @@ mod tests {
         );
         strategy.remove_directory(&destination).unwrap();
         assert!(!destination.exists());
+    }
+
+    /// Regression: the kernel refuses a whole-tree `clonefile` with `EACCES`
+    /// when any directory inside lacks the search bit, even one the caller
+    /// owns. Two empty `0644` directories in a checkout made every
+    /// `rift create --copy-all` from it fail with an error that named only the
+    /// root and blamed copy-on-write support.
+    #[test]
+    fn full_copy_names_a_directory_without_search_permission() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let unsearchable = source.join("lib");
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(source.join("node_modules/pkg/index.js"), "module").unwrap();
+        fs::create_dir(&unsearchable).unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::All)
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::BlockedEntry { path, permission: "u+x", source, .. }
+                if path == &unsearchable && is_denied(source)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("clone failed for {}: ", source.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("chmod u+x {}", unsearchable.display())),
+            "{message}"
+        );
+        assert!(!message.contains("copy-on-write"), "{message}");
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::metadata(&unsearchable).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("node_modules/pkg/index.js")).unwrap(),
+            "module"
+        );
+    }
+
+    /// `node_modules` is searched last, but a blocked entry inside it is still
+    /// named.
+    #[test]
+    fn full_copy_names_a_blocked_entry_inside_node_modules() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let unreadable = source.join("node_modules/pkg/index.js");
+        fs::create_dir_all(source.join("node_modules/pkg")).unwrap();
+        fs::write(&unreadable, "module").unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o200)).unwrap();
+
+        let result = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, Error::BlockedEntry { path, permission: "u+r", .. } if path == &unreadable),
+            "{error:?}"
+        );
+        assert!(!destination.exists());
+    }
+
+    /// Only a filesystem that cannot clone means copy-on-write is unavailable.
+    #[test]
+    fn clone_errors_name_copy_on_write_only_when_it_is_unavailable() {
+        let from = Path::new("/source");
+        let to = Path::new("/destination");
+        for errno in [libc::ENOSPC, libc::EIO, libc::EACCES] {
+            let message =
+                clone_error(from, to, std::io::Error::from_raw_os_error(errno)).to_string();
+            assert!(
+                message.starts_with("clone failed for /source: "),
+                "{message}"
+            );
+        }
+        for errno in [libc::EXDEV, libc::ENOTSUP] {
+            assert!(matches!(
+                clone_error(from, to, std::io::Error::from_raw_os_error(errno)),
+                Error::CowUnavailable(_)
+            ));
+        }
+    }
+
+    /// The suggested command is quoted for the shell, so a path with spaces
+    /// or metacharacters can be pasted as is.
+    #[test]
+    fn full_copy_quotes_the_suggested_command() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("it's a $source");
+        let destination = temp.path().join("destination");
+        let unsearchable = source.join("lib dir;touch pwned");
+        fs::create_dir_all(&unsearchable).unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let message = ApfsStrategy
+            .copy_directory(&source, &destination, CopyMode::All)
+            .unwrap_err()
+            .to_string();
+
+        let command = message
+            .split('`')
+            .nth(1)
+            .unwrap_or_else(|| panic!("{message}"));
+        assert!(command.starts_with("chmod u+x '"), "{message}");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(temp.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{message}");
+        assert_eq!(
+            fs::metadata(&unsearchable).unwrap().permissions().mode() & 0o777,
+            0o744
+        );
+        assert!(!temp.path().join("pwned").exists());
+    }
+
+    /// The kernel refuses a clone into an immutable or unwritable destination
+    /// parent too. A blocked entry in the source must not hide that: the
+    /// kernel's error is returned unchanged and the source is not blamed.
+    #[test]
+    fn full_copy_does_not_blame_the_source_when_the_destination_refuses() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let parent = temp.path().join("parent");
+        let destination = parent.join("destination");
+        let unsearchable = source.join("lib");
+        fs::create_dir_all(&unsearchable).unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let parent_path = c_path(&parent).unwrap();
+
+        // SAFETY: `parent_path` is a null-terminated C string that lives for
+        // each call.
+        assert_eq!(
+            unsafe { libc::chflags(parent_path.as_ptr(), libc::UF_IMMUTABLE as _) },
+            0
+        );
+        let immutable = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+        assert_eq!(unsafe { libc::chflags(parent_path.as_ptr(), 0) }, 0);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let unwritable = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for result in [immutable, unwritable] {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, Error::IoAt { operation: "clone", path, source: cause }
+                    if path == &source && is_denied(cause)),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("chmod"), "{error}");
+        }
+        assert!(!destination.exists());
+    }
+
+    /// An append-only destination parent still accepts a new entry, so it
+    /// must not hide a blocked entry in the source. Once the entry is fixed,
+    /// the clone succeeds under the same parent.
+    #[test]
+    fn full_copy_blames_the_source_when_the_destination_parent_is_append_only() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let parent = temp.path().join("parent");
+        let destination = parent.join("destination");
+        let unsearchable = source.join("lib");
+        fs::create_dir_all(&unsearchable).unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let parent_path = c_path(&parent).unwrap();
+
+        // SAFETY: `parent_path` is a null-terminated C string that lives for
+        // each call.
+        assert_eq!(
+            unsafe { libc::chflags(parent_path.as_ptr(), libc::UF_APPEND as _) },
+            0
+        );
+        let blocked = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+        fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixed = ApfsStrategy.copy_directory(&source, &destination, CopyMode::All);
+        let parent_flags =
+            std::os::macos::fs::MetadataExt::st_flags(&fs::metadata(&parent).unwrap());
+        // The flag is cleared before asserting so the temporary directory can
+        // be removed.
+        assert_eq!(unsafe { libc::chflags(parent_path.as_ptr(), 0) }, 0);
+
+        let error = blocked.unwrap_err();
+        assert!(
+            matches!(&error, Error::BlockedEntry { path, permission: "u+x", source: cause, .. }
+                if path == &unsearchable && is_denied(cause)),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("chmod u+x {}", unsearchable.display())),
+            "{error}"
+        );
+        fixed.unwrap();
+        assert_ne!(parent_flags & libc::UF_APPEND, 0);
+        assert_eq!(
+            fs::read_to_string(destination.join("file.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    /// A scan that fails for any reason other than a denied entry, here
+    /// `EMFILE`, is inconclusive. The kernel's error is returned and no
+    /// healthy entry is blamed. The file limit is lowered in a child process
+    /// so other tests keep their descriptors.
+    #[test]
+    fn full_copy_keeps_the_clone_error_when_the_scan_is_inconclusive() {
+        const CHILD: &str = "RIFT_TEST_LOW_FILE_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            let test = format!(
+                "{}::full_copy_keeps_the_clone_error_when_the_scan_is_inconclusive",
+                module_path!().split_once("::").unwrap().1
+            );
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test.as_str(), "--exact", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let deep = (0..16).fold(source.clone(), |path, level| path.join(level.to_string()));
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("file.txt"), "hello").unwrap();
+        let next_descriptor = fs::File::open("/dev/null").unwrap().as_raw_fd();
+        let limit = libc::rlimit {
+            rlim_cur: next_descriptor as libc::rlim_t + 2,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        // SAFETY: `limit` is a valid `rlimit` that lives for the call.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let scan = find_blocked_entry(&source);
+        let error = refused_clone_error(
+            &source,
+            &destination,
+            std::io::Error::from_raw_os_error(libc::EACCES),
+        );
+
+        assert_eq!(
+            scan.err().and_then(|error| error.raw_os_error()),
+            Some(libc::EMFILE)
+        );
+        assert!(
+            matches!(&error, Error::IoAt { operation: "clone", path, source: cause }
+                if path == &source && cause.raw_os_error() == Some(libc::EACCES)),
+            "{error:?}"
+        );
     }
 
     #[test]

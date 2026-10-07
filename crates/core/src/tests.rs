@@ -1251,6 +1251,43 @@ fn unwritable_destination_parent_failure_leaves_no_child_or_registry_row() {
     assert!(manager.list(&source).unwrap().is_empty());
 }
 
+/// A full copy refused by the kernel leaves no child, no registry row, and an
+/// unchanged source.
+#[cfg(target_os = "macos")]
+#[test]
+fn blocked_full_copy_leaves_no_child_or_registry_row() {
+    if running_as_root() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let source = source(&temp);
+    let unsearchable = source.join("lib");
+    let mut manager = Manager::open(temp.path().join("registry.sqlite")).unwrap();
+    manager.init(&source).unwrap();
+    fs::create_dir(&unsearchable).unwrap();
+    fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let result = manager.create_with_options(
+        create_input(source.clone(), "full"),
+        create_options(CopyMode::All, HookMode::Skip),
+    );
+
+    let mode = fs::metadata(&unsearchable).unwrap().permissions().mode() & 0o777;
+    fs::set_permissions(&unsearchable, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, Error::BlockedEntry { path, .. } if path == &unsearchable),
+        "{error:?}"
+    );
+    assert_eq!(mode, 0o644);
+    assert!(!child_path(&source, "full").exists());
+    assert!(manager.list(&source).unwrap().is_empty());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "hello"
+    );
+}
+
 #[test]
 fn unavailable_cow_does_not_create_a_child() {
     let temp = TempDir::new().unwrap();
